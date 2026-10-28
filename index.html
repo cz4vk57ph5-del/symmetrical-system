@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#101010">
+<link rel="preconnect" href="https://yahooproxy.b864v27974.workers.dev" crossorigin>
+<title>Top-Down Candle Panel</title>
+<style>
+html,body{margin:0;background:#101010;color:#e8e8e8;font-family:-apple-system,system-ui,sans-serif}
+#wrap{max-width:560px;margin:0 auto;padding:calc(6px + env(safe-area-inset-top,0px)) 8px calc(8px + env(safe-area-inset-bottom,0px))}
+svg{display:block;width:100%;height:auto}
+#st{font-size:10px;color:#8a8a8a;margin-top:4px;font-variant-numeric:tabular-nums}
+#st.err{color:#ffb74d}
+</style>
+</head>
+<body>
+<div id="wrap">
+<div id="chart"></div>
+<div id="st">Caricamento…</div>
+</div>
+<script>
+// Versione HTML di «Top-Down Candle Panel»: candele 5M, 15M, 1H, 4H affiancate, scalate attorno al prezzo attuale (linea blu),
+// con lettura della candela e tratteggio sul minimo raggiunto da 1H e 4H.
+// Dati: 1 minuto Yahoo (7 giorni) tramite il Worker, aggregati qui. Simbolo: ?s=QQQ (esempio: ?s=NQ%3DF per il future Nasdaq).
+const PROXY='https://yahooproxy.b864v27974.workers.dev';
+const SYMBOL=(new URLSearchParams(location.search).get('s')||'QQQ').toUpperCase();
+const REFRESH=10, SESSION_OPEN=570; // 09:30 ora di New York, in minuti dalla mezzanotte
+// Scale come nello script Pine (modalità Hybrid / Midpoint): ogni candela è centrata sul prezzo attuale e ingrandita
+const TFS=[
+ {m:5,  label:'5M',  scale:14.5, low:'#ff80ab'},
+ {m:15, label:'15M', scale:12.5, low:'#b2ff59'},
+ {m:60, label:'1H',  scale:8.0, low:'#00bcd4'},
+ {m:240,label:'4H',  scale:2.5, low:'#b388ff'}
+];
+const BULL='#00c89b', BEAR='#f23645', AMBER='#ffb100', BLUE='#2962ff', WICK='#9a9a9a';
+
+// ---------- dati ----------
+let urlOrder=[0,1,2], ctrl=null, timer=null;
+async function getBars(signal){
+ const path='/v8/finance/chart/'+encodeURIComponent(SYMBOL)+'?interval=1m&range=7d';
+ const urls=[PROXY+path,PROXY+'/?url='+encodeURIComponent('https://query1.finance.yahoo.com'+path),PROXY+'/?symbol='+encodeURIComponent(SYMBOL)+'&interval=1m&range=7d'];
+ let lastErr;
+ for(const i of urlOrder){
+  const ac=new AbortController(),onAbort=()=>ac.abort(),to=setTimeout(()=>ac.abort(),10000);
+  signal.addEventListener('abort',onAbort);
+  try{
+   const res=await fetch(urls[i],{cache:'no-store',signal:ac.signal});if(!res.ok)throw Error('HTTP '+res.status);
+   const data=await res.json();if(data?.chart?.error)throw Error(data.chart.error.description||'errore Yahoo');
+   const result=data?.chart?.result?.[0]||data?.result?.[0]||data;
+   const q=result?.indicators?.quote?.[0],ts=result?.timestamp;
+   if(!q||!ts)throw Error('Formato dati non riconosciuto');
+   const bars=[];
+   for(let k=0;k<ts.length;k++){
+    if(![q.open?.[k],q.high?.[k],q.low?.[k],q.close?.[k],ts[k]].every(Number.isFinite)||q.high[k]<q.low[k])continue;
+    bars.push({time:ts[k]*1000,open:q.open[k],high:q.high[k],low:q.low[k],close:q.close[k]});
+   }
+   bars.sort((a,b)=>a.time-b.time);for(let k=bars.length-1;k>0;k--)if(bars[k].time===bars[k-1].time)bars.splice(k,1);
+   // ultimo prezzo di Yahoo: aggiorna la candela in corso o crea quella nuova
+   const mt=result?.meta?.regularMarketTime*1000,mp=result?.meta?.regularMarketPrice;
+   if(bars.length&&Number.isFinite(mt)&&Number.isFinite(mp)){
+    const slot=Math.floor(mt/6e4)*6e4,last=bars[bars.length-1];
+    if(last.time===slot&&mt>=last.time){last.close=mp;last.high=Math.max(last.high,mp);last.low=Math.min(last.low,mp)}
+    else if(slot>last.time&&slot<=Date.now())bars.push({time:slot,open:mp,high:mp,low:mp,close:mp});
+   }
+   if(bars.length<10)throw Error('poche candele');
+   urlOrder=[i,...urlOrder.filter(x=>x!==i)];
+   return bars;
+  }catch(e){
+   if(signal.aborted)throw e;
+   lastErr=e.name==='AbortError'?Error('nessuna risposta entro 10 secondi'):e;
+  }finally{clearTimeout(to);signal.removeEventListener('abort',onAbort)}
+ }
+ throw lastErr||Error('Impossibile caricare i dati');
+}
+
+// ---------- aggregazione (ancorata alle 09:30 di New York, come le candele 1H/4H di TradingView sulle azioni USA) ----------
+const NYF=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
+function nyParts(t){const p={};for(const x of NYF.formatToParts(new Date(t)))p[x.type]=x.value;return {d:p.year+p.month+p.day,m:(+p.hour)*60+(+p.minute)}}
+function aggregate(bars,N){
+ const out=[];let key=null,cur=null;
+ for(let bi=0;bi<bars.length;bi++){const b=bars[bi];
+  const k=b.ny||(b.ny=nyParts(b.time)),kk=k.d+':'+Math.floor((k.m-SESSION_OPEN)/N);
+  if(kk!==key){key=kk;cur={time:b.time,open:b.open,high:b.high,low:b.low,close:b.close,hiT:b.time,loT:b.time,i0:bi};out.push(cur)}
+  else{if(b.high>cur.high){cur.high=b.high;cur.hiT=b.time}if(b.low<cur.low){cur.low=b.low;cur.loT=b.time}cur.close=b.close}
+ }
+ return out;
+}
+
+// ---------- lettura candela (stessa logica dello script Pine) ----------
+function candleRead(c){
+ const rng=Math.max(c.high-c.low,1e-9),body=Math.abs(c.close-c.open),
+  up=c.high-Math.max(c.open,c.close),lo=Math.min(c.open,c.close)-c.low,
+  bp=body/rng,upP=up/rng,loP=lo/rng,bull=c.close>=c.open;
+ if(bp<=0.15)return ['Doji'];
+ if(upP>=0.40&&upP>loP)return ['Upper','Rejection'];
+ if(loP>=0.40&&loP>upP)return ['Lower','Rejection'];
+ if(bp>=0.55)return bull?['Bullish','Expansion']:['Bearish','Expansion'];
+ return [bull?'Bullish':'Bearish'];
+}
+function readColor(lines,bull){return lines[0]==='Doji'||lines[1]==='Rejection'?AMBER:bull?BULL:BEAR}
+
+// ---------- distanza di ogni chiusura dal punto medio, calcolata "in diretta" ----------
+// Per ogni minuto: chiusura meno (massimo+minimo)/2 della candela fino a quel minuto (non quello finale).
+// Così un nuovo minimo/massimo sposta il punto medio da quel momento in poi, senza riscrivere i valori già passati.
+function distSeries(bars,N){
+ const out=new Array(bars.length);let key=null,hi=0,lo=0;
+ for(let i=0;i<bars.length;i++){const b=bars[i],k=b.ny||(b.ny=nyParts(b.time)),kk=k.d+':'+Math.floor((k.m-SESSION_OPEN)/N);
+  if(kk!==key){key=kk;hi=b.high;lo=b.low}else{if(b.high>hi)hi=b.high;if(b.low<lo)lo=b.low}
+  out[i]=b.close-(hi+lo)/2}
+ return out;
+}
+
+// ---------- sopra / sotto la linea blu ----------
+// La linea blu è il punto medio (massimo+minimo)/2 della candela in corso: ogni candela è disegnata centrata su di essa.
+// side: +1 se la chiusura è sopra il punto medio, -1 se sotto; since: da quando è sul lato attuale (inizio del minuto in cui è passata, ±1 min);
+// dots: segno delle ultime 3 variazioni di chiusura a 1 minuto (+1 su, -1 giù, 0 invariato), dalla più vecchia alla più recente.
+function sideInfo(bars,i0,ds){
+ let hi=-Infinity,lo=Infinity,side=0,since=bars[i0].time;
+ for(let i=i0;i<bars.length;i++){const b=bars[i];if(b.high>hi)hi=b.high;if(b.low<lo)lo=b.low;
+  const mid=(hi+lo)/2,sd=b.close>mid?1:b.close<mid?-1:0;
+  if(sd!==0&&sd!==side){side=sd;since=b.time}}
+ const n=bars.length,dots=ds.slice(Math.max(0,n-3));
+ const avgs=[];for(let k=Math.max(0,n-11);k<n;k++){let sum=0,cnt=0;for(let i=Math.max(0,k-9);i<=k;i++){sum+=ds[i];cnt++}avgs.push(sum/cnt)}
+ // picco della fase precedente: media10 per ogni minuto della candela; la fase attuale è la serie di minuti con lo stesso segno (sopra o sotto lo zero),
+ // quella precedente è la serie di segno opposto che veniva prima. Valore = la media più lontana da zero raggiunta in quella fase.
+ let peak=null,cpeak=null;
+ {const sg=v=>v>0.005?1:v<-0.005?-1:0,r=[];
+  for(let i=i0;i<n;i++){let sum=0,cnt=0;for(let j=Math.max(0,i-9);j<=i;j++){sum+=ds[j];cnt++}r.push(sum/cnt)}
+  let i=r.length-1;while(i>=0&&sg(r[i])===0)i--;
+  if(i>=0){const cs=sg(r[i]);cpeak=r[i];while(i>=0&&sg(r[i])!==-cs){if(sg(r[i])===cs&&Math.abs(r[i])>Math.abs(cpeak))cpeak=r[i];i--}
+   if(i>=0){let best=r[i];while(i>=0&&sg(r[i])!==cs){if(Math.abs(r[i])>Math.abs(best))best=r[i];i--}peak=best}}}
+ return {side,since,dots,avgs,peak,cpeak};
+}
+
+// ---------- disegno ----------
+const fmtEl=(ms)=>{const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60,p=v=>String(v).padStart(2,'0');return h?h+'h '+p(m)+'m '+p(r)+'s':m+'m '+p(r)+'s'};
+const fmtShort=(ms)=>{const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60,p=v=>String(v).padStart(2,'0');return h?h+'h '+p(m)+'m':m+'m '+p(r)+'s'};
+const fmtN=(v)=>v.toLocaleString('it-IT',{minimumFractionDigits:v>=1000?1:2,maximumFractionDigits:v>=1000?1:2});
+function buildSvg(cs,cur){
+ const W=420,H=645,L=8,R=72,padT=34,padB=H-390,bw=11; // le candele stanno sopra la fascia dei valori (da y=426 in giù)
+ // prezzo "da schermo": ogni candela è centrata sul prezzo attuale e ingrandita (anchor = punto medio)
+ // il corpo (proporzionale alla candela reale) sta tutto sopra la linea blu se la candela è "su" (chiusura sopra il punto medio), tutto sotto se è "giù"
+ const D=cs.map(c=>{const mid=(c.high+c.low)/2,f=p=>cur+(p-mid)*c.scale;
+  const o=f(c.open),h=f(c.high),l=f(c.low),cl=f(c.close),up=c.side?c.side>0:c.close>=c.open,
+   sh=up?cur-Math.min(o,cl):cur-Math.max(o,cl);
+  return {c,so:o+sh,sh:h+sh,sl:l+sh,sc:cl+sh}});
+ let mx=cur,mn=cur;for(const d of D){if(d.sh>mx)mx=d.sh;if(d.sl<mn)mn=d.sl}
+ if(mx-mn<1e-9){mx+=1;mn-=1}
+ const k=(H-padT-padB)/(mx-mn),y=v=>padT+(mx-v)*k,slotW=(W-L-R)/D.length;
+ const yc=y(cur);
+ let s='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Candele 5M 15M 1H 4H di '+SYMBOL+'" font-family="-apple-system,system-ui,sans-serif">';
+ s+='<rect width="'+W+'" height="'+H+'" fill="#101010"/>';
+ // fascia in basso: da quanto la chiusura sta sopra/sotto la linea blu + ultimi 3 minuti
+ s+='<line x1="'+L+'" x2="'+(W-R)+'" y1="426" y2="426" stroke="#262626"/>';
+ // linea blu (punto medio di ogni candela)
+ s+='<line x1="'+L+'" x2="'+(W-2)+'" y1="'+yc.toFixed(1)+'" y2="'+yc.toFixed(1)+'" stroke="'+BLUE+'" stroke-width="1" stroke-dasharray="1.5 3"/>';
+ D.forEach((d,i)=>{
+  const c=d.c,cx=L+slotW*(i+.5),bull=c.close>=c.open,col=bull?BULL:BEAR,
+   top=y(Math.max(d.so,d.sc)),bot=y(Math.min(d.so,d.sc)),h=Math.max(1.5,bot-top);
+  s+='<line x1="'+cx.toFixed(1)+'" x2="'+cx.toFixed(1)+'" y1="'+y(d.sh).toFixed(1)+'" y2="'+y(d.sl).toFixed(1)+'" stroke="'+WICK+'" stroke-width="1"/>';
+  s+='<rect x="'+(cx-bw).toFixed(1)+'" y="'+top.toFixed(1)+'" width="'+(bw*2)+'" height="'+h.toFixed(1)+'" fill="'+col+'"/>';
+  // etichetta del timeframe sopra il massimo
+  const ty=y(d.sh)-24,tw=c.label.length>2?36:30;
+  s+='<path d="M'+(cx-tw/2).toFixed(1)+','+ty.toFixed(1)+'h'+tw+'v16h-'+(tw/2-4)+'l-4,4l-4,-4h-'+(tw/2-4)+'z" fill="#1e222d"/>';
+  s+='<text x="'+cx.toFixed(1)+'" y="'+(ty+12).toFixed(1)+'" text-anchor="middle" font-size="11" fill="#fff">'+c.label+'</text>';
+  // lettura sotto il minimo
+  const rd=candleRead(c),rc=readColor(rd,bull);
+  rd.forEach((t,j)=>{s+='<text x="'+cx.toFixed(1)+'" y="'+(y(d.sl)+13+j*12).toFixed(1)+'" text-anchor="middle" font-size="10.5" fill="'+rc+'">'+t+'</text>'});
+  // sopra/sotto la linea blu: tempo (scorre ogni secondo) e 3 punti = ultimi 3 minuti
+  const sc2=c.side>0?BULL:c.side<0?BEAR:'#9a9a9a',pre=c.side>0?'sopra ':'sotto ';
+  s+=c.side?'<text class="el" data-t="'+c.since+'" data-p="'+pre+'" data-f="s" x="'+cx.toFixed(1)+'" y="440" text-anchor="middle" font-size="9.5" fill="'+sc2+'">'+pre+fmtShort(Date.now()-c.since)+'</text>':'<text x="'+cx.toFixed(1)+'" y="440" text-anchor="middle" font-size="9.5" fill="#9a9a9a">sulla linea</text>';
+  const dt=c.dots,off=3-dt.length;
+  for(let j=0;j<3;j++){const v=j<off?null:dt[j-off],txt=v===null?'–':(v>0?'+':v<0?'−':'')+Math.abs(v).toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2}),col2=v===null||Math.abs(v)<0.005?'#9a9a9a':v>0?'#3ddc84':'#ff5252';
+   s+='<text x="'+(cx-28+j*28).toFixed(1)+'" y="455" text-anchor="middle" font-size="9"'+(j===2?' font-weight="700"':'')+' fill="'+col2+'">'+txt+'</text>'}
+  // media10: elenco delle ultime medie (max 10), la più recente in alto, a destra la differenza rispetto alla media precedente; picco ora = valore più lontano da zero raggiunto dalla media10 nella fase attuale (anche se poi è tornata indietro); picco prec. = valore più lontano da zero raggiunto dalla media10 nella fase precedente, prima di passare dall'altra parte dello zero
+  s+='<text x="'+cx.toFixed(1)+'" y="470" text-anchor="middle" font-size="9.5" fill="#9a9a9a">media10 · differenza</text>';
+  const A=c.avgs,m=Math.min(10,A.length),fm=v=>(v>0?'+':v<0?'−':'')+Math.abs(v).toLocaleString('it-IT',{minimumFractionDigits:2,maximumFractionDigits:2}),cl=v=>Math.abs(v)<0.005?'#9a9a9a':v>0?'#3ddc84':'#ff5252';
+  for(let j=0;j<m;j++){const i=A.length-1-j,v=A[i],dl=i>0?v-A[i-1]:null,op=(j===0?1:Math.max(.45,1-j*.07)).toFixed(2),y0=(483+j*11.5).toFixed(1);
+   s+='<text x="'+(cx-4).toFixed(1)+'" y="'+y0+'" text-anchor="end" font-size="9"'+(j===0?' font-weight="700"':'')+' fill="'+cl(v)+'" fill-opacity="'+op+'">'+fm(v)+'</text>';
+   s+='<text x="'+(cx+4).toFixed(1)+'" y="'+y0+'" text-anchor="start" font-size="8.5" fill="'+(dl===null?'#9a9a9a':cl(dl))+'" fill-opacity="'+op+'">'+(dl===null?'–':fm(dl))+'</text>'}
+  // media delle differenze mostrate (le stesse della colonna a destra)
+  const dfs=[];for(let j=0;j<m;j++){const i=A.length-1-j;if(i>0)dfs.push(A[i]-A[i-1])}
+  const md=dfs.length?dfs.reduce((a,b)=>a+b,0)/dfs.length:null;
+  s+='<text x="'+cx.toFixed(1)+'" y="'+(483+m*11.5+8).toFixed(1)+'" text-anchor="middle" font-size="8.5" fill="#9a9a9a">media diff. <tspan font-weight="700" fill="'+(md===null?'#9a9a9a':cl(md))+'">'+(md===null?'–':fm(md))+'</tspan></text>';
+  // picco della media10 nella fase precedente (prima che passasse dall'altra parte dello zero)
+  const pk=c.peak,cp=c.cpeak;
+  s+='<text x="'+cx.toFixed(1)+'" y="'+(483+m*11.5+20).toFixed(1)+'" text-anchor="middle" font-size="8.5" fill="#9a9a9a">picco ora <tspan font-weight="700" fill="'+(cp===null?'#9a9a9a':cl(cp))+'">'+(cp===null?'–':fm(cp))+'</tspan></text>';
+  s+='<text x="'+cx.toFixed(1)+'" y="'+(483+m*11.5+32).toFixed(1)+'" text-anchor="middle" font-size="8.5" fill="#9a9a9a">picco prec. <tspan font-weight="700" fill="'+(pk===null?'#9a9a9a':cl(pk))+'">'+(pk===null?'–':fm(pk))+'</tspan></text>';
+ });
+ // tag del prezzo attuale
+ s+='<rect x="'+(W-70)+'" y="'+(yc-8).toFixed(1)+'" width="68" height="16" rx="3" fill="'+BLUE+'"/>';
+ s+='<text x="'+(W-36)+'" y="'+(yc+4).toFixed(1)+'" text-anchor="middle" font-size="10.5" font-weight="600" fill="#fff">'+fmtN(cur)+'</text>';
+ return s+'</svg>';
+}
+
+// ---------- ciclo ----------
+const st=document.getElementById('st'),chart=document.getElementById('chart');
+function setStatus(t,err){st.textContent=t;st.className=err?'err':''}
+async function load(){
+ if(ctrl)ctrl.abort();const c=ctrl=new AbortController();
+ try{
+  const bars=await getBars(c.signal);
+  const cur=bars[bars.length-1].close;
+  const cs=TFS.map(t=>{const a=aggregate(bars,t.m),last=a[a.length-1];return {...last,...sideInfo(bars,last.i0,distSeries(bars,t.m)),label:t.label,scale:t.scale,low_col:t.low||null}});
+  chart.innerHTML=buildSvg(cs,cur);
+  const hm=new Date().toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'});
+  setStatus(SYMBOL+' · aggiornato '+hm+' · candele in corso, ancorate alle 09:30 di New York · tempi dal minuto in cui sono avvenuti (±1 min) · sotto: da quanto la chiusura sta sopra/sotto la linea blu (punto medio della candela), 3 valori = distanza in punti dalla linea blu delle ultime 3 chiusure a 1 minuto (verde sopra, rosso sotto; ultimo in grassetto), media10 = elenco delle ultime 10 medie (su 10 distanze ciascuna, ognuna rispetto al punto medio che la candela aveva in quel minuto), la più recente in alto');
+ }catch(e){
+  if(c.signal.aborted)return;
+  setStatus('Errore: '+(e&&e.message||e)+' — riprovo tra '+REFRESH+' s',true);
+ }finally{
+  if(ctrl===c&&!document.hidden){clearTimeout(timer);timer=setTimeout(load,REFRESH*1000)}
+ }
+}
+function tickEl(){const n=Date.now();chart.querySelectorAll('text.el').forEach(e=>{e.textContent=(e.getAttribute('data-p')||'da ')+(e.getAttribute('data-f')?fmtShort:fmtEl)(n-(+e.getAttribute('data-t')))})}
+setInterval(tickEl,1000);
+document.addEventListener('visibilitychange',()=>{if(document.hidden){if(ctrl)ctrl.abort();clearTimeout(timer)}else load()});
+load();
+</script>
+</body>
+</html>
